@@ -1,0 +1,8 @@
+flask
+lingua-language-detector
+deep-translator
+transformers
+sentencepiece
+torch
+datasets
+sacrebleu

@@ -1,0 +1,14 @@
+[
+  {
+    "source": "Hello world",
+    "reference": ["Bonjour le monde"]
+  },
+  {
+    "source": "How are you?",
+    "reference": ["Comment ça va?"]
+  },
+  {
+    "source": "I love programming",
+    "reference": ["J'adore la programmation"]
+  }
+]
