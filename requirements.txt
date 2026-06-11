@@ -1,6 +1,4 @@
-git add requirements.txt
-git commit -m "Added gunicorn for Render deployment"
-git push origin main
+gunicorn
 flask
 lingua-language-detector
 deep-translator
