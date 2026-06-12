@@ -8,3 +8,4 @@ torch
 datasets
 sacrebleu
 googletrans==4.0.0rc1
+sacremoses
