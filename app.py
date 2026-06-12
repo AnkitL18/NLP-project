@@ -2,217 +2,518 @@ from flask import Flask, render_template, request, jsonify
 from lingua import LanguageDetectorBuilder
 from transformers import MarianMTModel, MarianTokenizer
 from dataset.home import translator
-import re
 from sacrebleu import corpus_bleu
 import json
+import os
+import gc
+
+# ─────────────────────────────────────────────────────────────
+# Flask App Initialization
+# ─────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
 
-# ── Initialize detector ──────────────────────────────────────────
-print("Loading language detector...")
-detector = LanguageDetectorBuilder.from_all_languages() \
-                                  .with_preloaded_language_models() \
-                                  .build()
-print("Detector ready!")
+print("======================================")
+print("Starting NLP Translation Server...")
+print("======================================")
 
-# ── Model cache - stores loaded models so they dont reload ───────
+# ─────────────────────────────────────────────────────────────
+# Language Detector Initialization
+# ─────────────────────────────────────────────────────────────
+
+try:
+    print("Loading language detector...")
+
+    detector = (
+        LanguageDetectorBuilder
+        .from_all_languages()
+        .with_preloaded_language_models()
+        .build()
+    )
+
+    print("Language detector loaded successfully!")
+
+except Exception as e:
+    print("Error loading detector:", e)
+    detector = None
+
+
+# ─────────────────────────────────────────────────────────────
+# Global Model Cache
+# Stores already loaded Marian models
+# ─────────────────────────────────────────────────────────────
+
 model_cache = {}
 
-# ── Supported languages ──────────────────────────────────────────
+# Limit cache size to prevent Render memory crash
+MAX_MODELS_IN_MEMORY = 1
+
+
+# ─────────────────────────────────────────────────────────────
+# Supported Languages
+# Keep fewer languages for Render free tier
+# You can add more later
+# ─────────────────────────────────────────────────────────────
+
 LANGUAGES = {
-    "en":  "English",
-    "hi":  "Hindi",
-    "es":  "Spanish",
-    "fr":  "French",
-    "de":  "German",
-    "ar":  "Arabic",
-    "pt":  "Portuguese",
-    "ru":  "Russian",
-    "ja":  "Japanese",
-    
-    
-    "hu":  "Hungarian",
-    "uk":  "Ukrainian",
-    "bg":  "Bulgarian",
-    "hr":  "Croatian",
-    "sk":  "Slovak",
-    "lt":  "Lithuanian",
-    "lv":  "Latvian",
-    "et":  "Estonian",
-    
-    "mr":  "Marathi",
-    
+    "en": "English",
+    "hi": "Hindi",
+    "fr": "French",
+    "es": "Spanish",
+    "de": "German"
 }
 
-# ── Low resource languages ───────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Low Resource Languages
+# These use your custom translator()
+# instead of heavy MarianMT models
+# ─────────────────────────────────────────────────────────────
+
 LOW_RESOURCE = [
-    "mr", "ta", "te", "gu", "pa", "bn",
-    "ur", "sw", "th", "vi", "ms", "km",
-    "lo", "my", "si", "ne", "hy", "ka"
+    "mr",
+    "ta",
+    "te",
+    "gu",
+    "pa",
+    "bn",
+    "ur",
+    "sw",
+    "th",
+    "vi",
+    "ms",
+    "km",
+    "lo",
+    "my",
+    "si",
+    "ne",
+    "hy",
+    "ka"
 ]
 
-# ── Load model with caching ──────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────
+# Helper function to clear old models
+# Prevents Render from running out of RAM
+# ─────────────────────────────────────────────────────────────
+
+def clear_model_cache():
+    global model_cache
+
+    print("Clearing old models from memory...")
+
+    for _, model_data in model_cache.items():
+        del model_data
+
+    model_cache.clear()
+
+    gc.collect()
+
+    print("Memory cleaned.")
+# ─────────────────────────────────────────────────────────────
+# Load MarianMT Model Safely with Cache Control
+# ─────────────────────────────────────────────────────────────
+
 def load_model(model_name):
+    global model_cache
 
-    if model_name not in model_cache:
-        print("Loading model:", model_name)
+    # Use existing model if already loaded
+    if model_name in model_cache:
+        print(f"Using cached model: {model_name}")
+        return model_cache[model_name]
 
-        tokenizer = MarianTokenizer.from_pretrained(model_name)
-        model = MarianMTModel.from_pretrained(model_name)
+    try:
+        print(f"Loading new model: {model_name}")
+
+        # Free memory if cache limit reached
+        if len(model_cache) >= MAX_MODELS_IN_MEMORY:
+            clear_model_cache()
+
+        tokenizer = MarianTokenizer.from_pretrained(
+            model_name,
+            local_files_only=False
+        )
+
+        model = MarianMTModel.from_pretrained(
+            model_name,
+            local_files_only=False
+        )
 
         model_cache[model_name] = (tokenizer, model)
 
-        print("Model cached:", model_name)
+        print(f"Model loaded successfully: {model_name}")
 
-    else:
-        print("Using cached model:", model_name)
+        return tokenizer, model
 
-    return model_cache[model_name]
+    except Exception as e:
+        print("======================================")
+        print("MODEL LOADING FAILED")
+        print("Model:", model_name)
+        print("Error:", str(e))
+        print("======================================")
+        raise
 
 
-# ── Simple translation helper (NO CHUNKING) ──────────────────────
+# ─────────────────────────────────────────────────────────────
+# Translation Helper
+# ─────────────────────────────────────────────────────────────
+
 def run_translation(text, model, tokenizer):
 
-    inputs = tokenizer(
-        text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=512
-    )
+    try:
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=128  # Reduced from 512 to save memory
+        )
 
-    output = model.generate(**inputs)
+        output = model.generate(
+            **inputs,
+            max_length=128
+        )
 
-    decoded = tokenizer.decode(
-        output[0],
-        skip_special_tokens=True
-    )
+        translated_text = tokenizer.decode(
+            output[0],
+            skip_special_tokens=True
+        )
 
-    return decoded
+        return translated_text
+
+    except Exception as e:
+        print("Translation generation failed:", str(e))
+        raise
 
 
-# ── Main Translation Function ────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Main Translation Logic
+# ─────────────────────────────────────────────────────────────
+
 def translate_text(text, src_code, tgt_code):
 
-    #  FAST PATH (use hidden translator immediately)
-    if src_code in LOW_RESOURCE or tgt_code in LOW_RESOURCE:
-        result = translator(text, src_code, tgt_code)
-        return result, "Marian MT"
+    print(
+        f"Translation request: {src_code} -> {tgt_code}"
+    )
 
-    # ---- Direct MarianMT ----
+    # Low resource languages use custom translator
+    if src_code in LOW_RESOURCE or tgt_code in LOW_RESOURCE:
+
+        print("Using custom low-resource translator")
+
+        try:
+            result = translator(
+                text,
+                src_code,
+                tgt_code
+            )
+
+            return result, "Custom Translator"
+
+        except Exception as e:
+            print(
+                "Custom translator failed:",
+                str(e)
+            )
+            raise
+
+
+    # Try direct Marian translation
     try:
-        model_name = f"Helsinki-NLP/opus-mt-{src_code}-{tgt_code}"
+        model_name = (
+            f"Helsinki-NLP/opus-mt-{src_code}-{tgt_code}"
+        )
+
         tokenizer, model = load_model(model_name)
 
-        result = run_translation(text, model, tokenizer)
+        result = run_translation(
+            text,
+            model,
+            tokenizer
+        )
+
         return result, "Marian MT"
 
-    except Exception:
-        pass
+    except Exception as e:
 
-    # ---- Pivot via English ----
+        print(
+            "Direct translation failed:",
+            str(e)
+        )
+
+
+    # Fallback: translate via English
     try:
-        tok1, mod1 = load_model(
+
+        print("Trying English pivot translation")
+
+        tokenizer1, model1 = load_model(
             f"Helsinki-NLP/opus-mt-{src_code}-en"
         )
-        en_text = run_translation(text, mod1, tok1)
 
-        tok2, mod2 = load_model(
+        english_text = run_translation(
+            text,
+            model1,
+            tokenizer1
+        )
+
+
+        tokenizer2, model2 = load_model(
             f"Helsinki-NLP/opus-mt-en-{tgt_code}"
         )
-        result = run_translation(en_text, mod2, tok2)
 
-        return result, "Marian MT"
+        final_text = run_translation(
+            english_text,
+            model2,
+            tokenizer2
+        )
 
-    except Exception:
-        pass
-
-    
-    result = translator(text, src_code, tgt_code)
-    return result, "Marian MT"
+        return final_text, "Marian MT Pivot"
 
 
+    except Exception as e:
 
-# ── Flask routes ─────────────────────────────────────────────────
+        print(
+            "Pivot translation failed:",
+            str(e)
+        )
+
+
+    # Final fallback
+    try:
+
+        print("Using final fallback translator")
+
+        result = translator(
+            text,
+            src_code,
+            tgt_code
+        )
+
+        return result, "Fallback Translator"
+
+    except Exception as e:
+
+        print(
+            "All translation methods failed:",
+            str(e)
+        )
+
+        raise Exception(
+            "Translation service is currently unavailable"
+        )
+# ─────────────────────────────────────────────────────────────
+# Home Route
+# ─────────────────────────────────────────────────────────────
+
 @app.route("/")
 def index():
-    return render_template("index.html", languages=LANGUAGES)
+    return render_template(
+        "index.html",
+        languages=LANGUAGES
+    )
 
+
+# ─────────────────────────────────────────────────────────────
+# Language Detection API
+# ─────────────────────────────────────────────────────────────
 
 @app.route("/detect", methods=["POST"])
 def detect():
-    data = request.get_json()
-    text = data.get("text", "").strip()
-    if not text:
-        return jsonify({"error": "No text provided"}), 400
 
-    detected = detector.detect_language_of(text)
-    if not detected:
-        return jsonify({"error": "Could not detect language"}), 400
+    try:
+        data = request.get_json()
 
-    lang_code = detected.iso_code_639_1.name.lower()
-    lang_name = detected.name
+        if not data:
+            return jsonify({
+                "error": "No JSON data received"
+            }), 400
 
-    return jsonify({
-        "detected_code": lang_code,
-        "detected_name": lang_name
-    })
+        text = data.get("text", "").strip()
 
+        if not text:
+            return jsonify({
+                "error": "No text provided"
+            }), 400
+
+
+        if detector is None:
+            return jsonify({
+                "error": "Language detector not available"
+            }), 500
+
+
+        detected = detector.detect_language_of(text)
+
+
+        if not detected:
+            return jsonify({
+                "error": "Could not detect language"
+            }), 400
+
+
+        return jsonify({
+            "detected_code":
+                detected.iso_code_639_1.name.lower(),
+
+            "detected_name":
+                detected.name
+        })
+
+
+    except Exception as e:
+
+        print("DETECTION ERROR:", str(e))
+
+        return jsonify({
+            "error": str(e)
+        }), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# Translation API
+# ─────────────────────────────────────────────────────────────
 
 @app.route("/translate", methods=["POST"])
 def translate():
-    data     = request.get_json()
-    text     = data.get("text", "").strip()
-    src_code = data.get("src_code", "")
-    tgt_code = data.get("tgt_code", "")
-
-    if not text or not src_code or not tgt_code:
-        return jsonify({"error": "Missing fields"}), 400
-
-    if src_code == tgt_code:
-        return jsonify({"error": "Source and target language are the same"}), 400
 
     try:
-        result, engine = translate_text(text, src_code, tgt_code)
+        data = request.get_json()
+
+        if not data:
+            return jsonify({
+                "error": "No JSON received"
+            }), 400
+
+
+        text = data.get("text", "").strip()
+        src_code = data.get("src_code", "")
+        tgt_code = data.get("tgt_code", "")
+
+
+        if not text or not src_code or not tgt_code:
+            return jsonify({
+                "error": "Missing translation fields"
+            }), 400
+
+
+        if src_code == tgt_code:
+            return jsonify({
+                "error": "Source and target languages cannot be the same"
+            }), 400
+
+
+        print("=" * 50)
+        print("TRANSLATION REQUEST RECEIVED")
+        print("Source:", src_code)
+        print("Target:", tgt_code)
+        print("Text:", text[:100])
+        print("=" * 50)
+
+
+        translated_text, engine = translate_text(
+            text,
+            src_code,
+            tgt_code
+        )
+
+
         return jsonify({
-            "translated": result,
-            "engine":     engine
+            "translated": translated_text,
+            "engine": engine,
+            "status": "success"
         })
+
+
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
-# ── NEW: BLEU evaluation route ────────────────────────────────────
+
+        print("=" * 50)
+        print("TRANSLATION ERROR")
+        print(str(e))
+        print("=" * 50)
+
+
+        return jsonify({
+            "error": str(e),
+            "status": "failed"
+        }), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# BLEU Evaluation Route
+# ─────────────────────────────────────────────────────────────
+
 @app.route("/evaluate", methods=["GET"])
 def evaluate():
+
     try:
-        # Load reference JSON
-        with open("references.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
+
+        with open(
+            "references.json",
+            "r",
+            encoding="utf-8"
+        ) as file:
+
+            data = json.load(file)
+
 
         predicted = []
         references = []
 
-        # Translate each source sentence
+
         for item in data:
-            src_text = item["source"]
-            tgt_code = "fr"  # target language code (change if needed)
-            src_code = "en"  # source language code (change if needed)
 
-            translated, engine = translate_text(src_text, src_code, tgt_code)
-            predicted.append(translated)
-            references.append(item["reference"])  # already a list
+            source_text = item["source"]
 
-        # Compute BLEU
-        bleu = corpus_bleu(predicted, references)
+            translated_text, _ = translate_text(
+                source_text,
+                "en",
+                "fr"
+            )
 
-        return {
+            predicted.append(
+                translated_text
+            )
+
+            references.append(
+                item["reference"]
+            )
+
+
+        bleu = corpus_bleu(
+            predicted,
+            references
+        )
+
+
+        return jsonify({
             "bleu_score": bleu.score,
-            "predicted_translations": predicted
-        }
+            "total_samples": len(predicted),
+            "status": "success"
+        })
+
 
     except Exception as e:
-        return {"error": str(e)}, 500
+
+        print("BLEU EVALUATION ERROR:", str(e))
+
+        return jsonify({
+            "error": str(e),
+            "status": "failed"
+        }), 500
+
+
+# ─────────────────────────────────────────────────────────────
+# Render Local Development Run
+# Gunicorn will ignore this block
+# ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
-    
-    
+
+    print("Starting Flask development server...")
+
+    app.run(
+        host="0.0.0.0",
+        port=5000,
+        debug=False
+    )
